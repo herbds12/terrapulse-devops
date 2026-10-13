@@ -84,7 +84,7 @@ Database__ApplyMigrations=true dotnet test
 |---|---|---|
 | Pull request para `develop`/`main` | Build → Testes | (nenhum; bloqueia o merge se falhar) |
 | Push em `develop` | Build → Testes → Imagem Docker → Deploy | **Staging** |
-| Push/merge em `main` | Build → Testes → Imagem Docker → **Aprovação manual** → Deploy | **Produção** |
+| Push/merge em `main` (ou disparo manual `workflow_dispatch`) | Build → Testes → Imagem Docker → **Aprovação manual** → Deploy | **Produção** |
 
 ```text
  ┌───────┐   ┌────────┐   ┌──────────────┐   ┌──────────────────┐
@@ -106,14 +106,14 @@ Database__ApplyMigrations=true dotnet test
 
 | Ambiente GitHub | Web App Azure | Banco Azure SQL | Proteção |
 |---|---|---|---|
-| `staging` | `terrapulse-stg-rm565128` | `terrapulse-staging` | Deploy automático |
-| `production` | `terrapulse-prd-rm565128` | `terrapulse-production` | **Required reviewer** (aprovação manual) |
+| `staging` | `terrapulse-stg-rm565128` | `terrapulse-staging` (Basic) | Deploy automático |
+| `production` | `terrapulse-prd-rm565128` | `terrapulse-production` (Basic) | **Required reviewer** (aprovação manual) |
 
 - **Secrets:** `AZURE_PUBLISH_PROFILE_STAGING`, `AZURE_PUBLISH_PROFILE_PRODUCTION`
 - **Variables:** `AZURE_WEBAPP_STAGING`, `AZURE_WEBAPP_PRODUCTION`
 - Connection strings, chave JWT e demais configurações ficam nas **App Settings** de cada Web App, nunca no código.
 
-A infraestrutura dos dois ambientes é criada de forma reproduzível pelo script [`infra/azure-setup.sh`](infra/azure-setup.sh), que usa a Azure CLI.
+Região: **Chile Central** (permitida pela assinatura Azure for Students). A infraestrutura dos dois ambientes é criada de forma reproduzível pelo script [`infra/azure-setup.sh`](infra/azure-setup.sh), que usa a Azure CLI.
 
 ## Containerização
 
@@ -196,27 +196,60 @@ ENTRYPOINT ["dotnet", "TerraPulse.Api.dll"]
 
 ## Prints do funcionamento
 
-> As imagens ficam em [`docs/prints/`](docs/prints/).
+> As imagens ficam em [`docs/prints/`](docs/prints/). A documentação técnica em PPT/PDF traz todas comentadas.
 
-| # | Evidência | Print |
-|---|---|---|
-| 1 | `docker compose up` com os containers saudáveis | ![](docs/prints/01-docker-compose-ps.png) |
-| 2 | Swagger rodando localmente | ![](docs/prints/02-swagger-local.png) |
-| 3 | Pipeline completo na branch `develop` | ![](docs/prints/03-pipeline-develop.png) |
-| 4 | Etapa de testes automatizados (resumo) | ![](docs/prints/04-testes.png) |
-| 5 | Imagem publicada no GitHub Container Registry | ![](docs/prints/05-ghcr-imagem.png) |
-| 6 | Staging: `/health` com o SHA do commit | ![](docs/prints/06-staging-health.png) |
-| 7 | Staging: Swagger + login funcionando | ![](docs/prints/07-staging-swagger.png) |
-| 8 | Aprovação manual do deploy de produção | ![](docs/prints/08-aprovacao-producao.png) |
-| 9 | Pipeline completo na branch `main` | ![](docs/prints/09-pipeline-main.png) |
-| 10 | Produção: `/health` com o SHA do commit | ![](docs/prints/10-producao-health.png) |
-| 11 | Produção: Swagger + consulta funcionando | ![](docs/prints/11-producao-swagger.png) |
-| 12 | Recursos no portal Azure | ![](docs/prints/12-azure-recursos.png) |
+### Execução local com Docker
+| Evidência | Print |
+|---|---|
+| Build da imagem e subida do Compose (rede, volume, banco *healthy*) | ![](docs/prints/00-docker-build.png) |
+| `docker compose ps`: API e SQL Server rodando | ![](docs/prints/01-docker-compose-ps.png) |
+| `/health` local conectado ao banco | ![](docs/prints/02a-health-local.png) |
+| Swagger local: GET autenticado retornando 200 | ![](docs/prints/02-swagger-local.png) |
+
+### Pipeline CI/CD
+| Evidência | Print |
+|---|---|
+| Pipeline da branch `develop`: Build → Testes → Docker → Deploy Staging | ![](docs/prints/03-pipeline-develop.png) |
+| Testes automatizados: 6 de 6 aprovados | ![](docs/prints/04-testes.png) |
+| Imagem publicada no GHCR com a tag do SHA do commit | ![](docs/prints/05-ghcr-imagem.png) |
+| Aprovação manual exigida para produção | ![](docs/prints/08-aprovacao-producao.png) |
+| Pipeline da branch `main` com Deploy Produção aprovado | ![](docs/prints/09-pipeline-main.png) |
+
+### Staging
+| Evidência | Print |
+|---|---|
+| `/health`: `Staging`, versão `c9af83b…`, banco conectado | ![](docs/prints/06-staging-health.png) |
+| Swagger: login respondendo 200 | ![](docs/prints/07-staging-swagger.png) |
+
+### Produção
+| Evidência | Print |
+|---|---|
+| `/health`: `Production`, versão `c9af83b…`, banco conectado | ![](docs/prints/10-producao-health.png) |
+| Swagger: login respondendo 200 | ![](docs/prints/11-producao-swagger.png) |
+
+### Infraestrutura e configuração
+| Evidência | Print |
+|---|---|
+| Resource Group no Azure (plano, 2 Web Apps, SQL Server, 2 bancos) | ![](docs/prints/12-azure-recursos.png) |
+| GitHub Environments (`production` com aprovação obrigatória) | ![](docs/prints/13-github-environments.png) |
+| Secrets do pipeline | ![](docs/prints/14-github-secrets.png) |
+| Variables do pipeline | ![](docs/prints/15-github-variables.png) |
 
 **Links:**
-- Execuções do pipeline: `https://github.com/herbds12/terrapulse-devops/actions`
+- Execuções do pipeline: https://github.com/herbds12/terrapulse-devops/actions
 - Staging: https://terrapulse-stg-rm565128.azurewebsites.net/swagger
 - Produção: https://terrapulse-prd-rm565128.azurewebsites.net/swagger
+
+## Desafios encontrados e soluções
+
+| Desafio | Solução |
+|---|---|
+| Os testes existentes eram de integração (`WebApplicationFactory`) e dependiam de um SQL Server LocalDB, que não existe no runner Linux do GitHub Actions. | SQL Server 2022 como *service container* no job de testes; migrations aplicadas por variável (`Database__ApplyMigrations`) e paralelismo do xUnit desligado para evitar corrida nas migrations. |
+| A assinatura Azure for Students bloqueou a criação em `eastus2` (`RequestDisallowedByAzure`). | Consulta da policy com `az policy assignment list` e uso de uma das regiões permitidas: **Chile Central**. |
+| A oferta gratuita do Azure SQL não é suportada nessa região (`ProvisioningDisabled`). | O script `azure-setup.sh` passou a cair automaticamente para o tier **Basic** e a ser idempotente: pode ser rodado de novo sem duplicar recursos. |
+| Criar a branch `main` apontando para o mesmo commit da `develop` não disparou o workflow, porque o filtro `paths-ignore` não encontra arquivos alterados. | Disparo manual com `workflow_dispatch` na branch `main`; o deploy de produção seguiu com aprovação manual. |
+| O Azure precisa conseguir baixar a imagem do registry. | Repositório público, então o pacote no GHCR ficou público e o Web App baixa a imagem sem credenciais extras. |
+| Garantir que o deploy realmente subiu a versão nova. | Endpoint `/health` exibindo o SHA do commit e smoke test no pipeline, que só passa quando o ambiente responde `Healthy` com o SHA esperado. |
 
 ## Tecnologias utilizadas
 
