@@ -1,0 +1,19 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.rsuser
+.vs/
+.vscode/
+TestResults/
+*.trx
+
+# Segredos / ambiente
+.env
+*.PublishSettings
+*.publishsettings
+
+# SO
+.DS_Store
+Thumbs.db

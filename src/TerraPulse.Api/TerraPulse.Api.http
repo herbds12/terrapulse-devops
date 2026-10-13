@@ -1,0 +1,14 @@
+@host = http://localhost:8080
+
+GET {{host}}/health
+Accept: application/json
+
+###
+GET {{host}}/api/areas-monitoradas?pageNumber=1&pageSize=10
+Accept: application/json
+
+###
+POST {{host}}/api/auth/login
+Content-Type: application/json
+
+{ "email": "admin@terrapulse.ai", "senha": "Terra@123" }

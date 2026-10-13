@@ -1,0 +1,219 @@
+# =====================================================================
+# TerraPulse - Pipeline CI/CD (GitHub Actions)
+#
+#  develop  -> build -> testes -> imagem Docker -> deploy STAGING
+#  main     -> build -> testes -> imagem Docker -> deploy PRODUCAO (com aprovacao)
+#  pull_request -> build + testes (bloqueia merge se falhar)
+# =====================================================================
+name: CI/CD TerraPulse
+
+on:
+  push:
+    branches: [develop, main]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  SOLUTION: TerraPulse.sln
+  IMAGE_NAME: terrapulse-api
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1) BUILD
+  # ------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restaurar dependencias
+        run: dotnet restore ${{ env.SOLUTION }}
+
+      - name: Compilar (Release)
+        run: dotnet build ${{ env.SOLUTION }} -c Release --no-restore
+
+  # ------------------------------------------------------------------
+  # 2) TESTES AUTOMATIZADOS (xUnit + SQL Server em container)
+  # ------------------------------------------------------------------
+  test:
+    name: Testes automatizados
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: 'Y'
+          MSSQL_SA_PASSWORD: TerraPulseCi2026Pwd
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TerraPulseCi2026Pwd -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+          --health-start-period 20s
+    env:
+      ConnectionStrings__DefaultConnection: Server=localhost,1433;Database=TerraPulseDb_CI;User Id=sa;Password=TerraPulseCi2026Pwd;TrustServerCertificate=True;Encrypt=False
+      Database__ApplyMigrations: 'true'
+      Jwt__Key: TERRAPULSE_CHAVE_SOMENTE_PARA_TESTES_DE_CI_2026_XYZ
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Executar testes
+        run: >
+          dotnet test ${{ env.SOLUTION }} -c Release
+          --logger "trx;LogFileName=test-results.trx"
+          --logger "console;verbosity=normal"
+          --results-directory ./TestResults
+
+      - name: Publicar resultados dos testes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ./TestResults
+
+      - name: Resumo dos testes
+        if: always()
+        run: |
+          echo "## Resultado dos testes" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, xml.etree.ElementTree as ET
+          ns = {'t': 'http://microsoft.com/schemas/VisualStudio/TeamTest/2010'}
+          for f in glob.glob('TestResults/**/*.trx', recursive=True):
+              c = ET.parse(f).getroot().find('.//t:Counters', ns).attrib
+              print(f"| Total | Passou | Falhou |\n|---|---|---|\n| {c['total']} | {c['passed']} | {c['failed']} |")
+          PY
+
+  # ------------------------------------------------------------------
+  # 3) IMAGEM DOCKER -> GitHub Container Registry (ghcr.io)
+  # ------------------------------------------------------------------
+  docker:
+    name: Build & push da imagem Docker
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Definir nome da imagem
+        id: vars
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo=ghcr.io/${OWNER}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${OWNER}/${IMAGE_NAME}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_name }}" = "main" ]; then echo "channel=production" >> "$GITHUB_OUTPUT"; else echo "channel=staging" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: APP_VERSION=${{ github.sha }}
+          tags: |
+            ${{ steps.vars.outputs.image }}
+            ${{ steps.vars.outputs.repo }}:${{ steps.vars.outputs.channel }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ------------------------------------------------------------------
+  # 4a) DEPLOY STAGING (branch develop)
+  # ------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy Staging
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://${{ vars.AZURE_WEBAPP_STAGING }}.azurewebsites.net/swagger
+    steps:
+      - name: Deploy no Azure Web App (staging)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_STAGING }}
+          publish-profile: ${{ secrets.AZURE_PUBLISH_PROFILE_STAGING }}
+          images: ${{ needs.docker.outputs.image }}
+
+      - name: Smoke test (/health deve responder com a nova versao)
+        run: |
+          URL="https://${{ vars.AZURE_WEBAPP_STAGING }}.azurewebsites.net/health"
+          for i in $(seq 1 30); do
+            BODY=$(curl -s --max-time 20 "$URL" || true)
+            echo "Tentativa $i: $BODY"
+            if echo "$BODY" | grep -q '"status":"Healthy"' && echo "$BODY" | grep -q "${{ github.sha }}"; then
+              echo "### Staging OK" >> "$GITHUB_STEP_SUMMARY"
+              echo '```json' >> "$GITHUB_STEP_SUMMARY"; echo "$BODY" >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Staging nao ficou saudavel a tempo"; exit 1
+
+  # ------------------------------------------------------------------
+  # 4b) DEPLOY PRODUCAO (branch main, com aprovacao manual)
+  # ------------------------------------------------------------------
+  deploy-production:
+    name: Deploy Producao
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://${{ vars.AZURE_WEBAPP_PRODUCTION }}.azurewebsites.net/swagger
+    steps:
+      - name: Deploy no Azure Web App (producao)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_PRODUCTION }}
+          publish-profile: ${{ secrets.AZURE_PUBLISH_PROFILE_PRODUCTION }}
+          images: ${{ needs.docker.outputs.image }}
+
+      - name: Smoke test (/health deve responder com a nova versao)
+        run: |
+          URL="https://${{ vars.AZURE_WEBAPP_PRODUCTION }}.azurewebsites.net/health"
+          for i in $(seq 1 30); do
+            BODY=$(curl -s --max-time 20 "$URL" || true)
+            echo "Tentativa $i: $BODY"
+            if echo "$BODY" | grep -q '"status":"Healthy"' && echo "$BODY" | grep -q "${{ github.sha }}"; then
+              echo "### Producao OK" >> "$GITHUB_STEP_SUMMARY"
+              echo '```json' >> "$GITHUB_STEP_SUMMARY"; echo "$BODY" >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Producao nao ficou saudavel a tempo"; exit 1

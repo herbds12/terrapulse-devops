@@ -1,0 +1,15 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+**/*.user
+**/*.suo
+**/*.rsuser
+.git/
+.github/
+docs/
+infra/
+tests/
+.env
+*.md
+docker-compose*.yml
